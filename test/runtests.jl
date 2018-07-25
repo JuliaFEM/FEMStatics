@@ -25,6 +25,12 @@ function FEMBase.get_gdofs(dofmap::SimpleDOFMap, nodes, dof_names)
     return (max_dim*(perm[j]-1)+ldi[n] for j in nodes for n in dof_names)
 end
 
+"""
+    Static
+
+Static analysis runs analysis from `t0` to `t1` in several increments. In each
+increment, force equilibrium is achieved by Newton-Rhapson iterations.
+"""
 mutable struct Static <: AbstractAnalysis
     t0 :: Float64
     t1 :: Float64
@@ -32,11 +38,12 @@ mutable struct Static <: AbstractAnalysis
     min_increment_time :: Float64
     max_increment_time :: Float64
     max_iterations :: Int64
-    dofs :: AbstractDOFMap
+    max_increments :: Int64
+    dofmap :: AbstractDOFMap
 end
 
 function Static()
-    return Static(0.0, 1.0, Inf, 1.0e-5, Inf, 20, SimpleDOFMap())
+    return Static(0.0, 1.0, Inf, 1.0e-5, Inf, 20, 10000, SimpleDOFMap())
 end
 
 function initialize_dofs!(dofmap, problems)
@@ -64,9 +71,47 @@ function initialize_dofs!(dofmap, problems)
     info("Number of nodes in analysis: $nnodes. Maximum node id: $(maximum(node_ids)).")
     # TODO: Add NodeNumbering.jl here.
     sorted_node_ids = sort(collect(node_ids))
-    dofmap.permutation = perm = Dict(j=>i for (i, j) in enumerate(sorted_node_ids))
+    dofmap.permutation = Dict(j=>i for (i, j) in enumerate(sorted_node_ids))
+    info("Analysis dofmap initialized.")
+end
+
+struct LUSolver <: AbstractLinearSystemSolver end
+
+"""
+    solve!(ls::LinearSystem, solver::LUSolver)
+
+Solve linear system using LU factorization. If linear system has zero rows,
+1.0 is added to diagonal to make matrix non-singular.
+"""
+function FEMBase.solve!(ls::LinearSystem, solver::LUSolver)
+
+    info("Solving linear system using LUSolver")
+
+    A = [ls.K ls.C1; ls.C2 ls.D]
+    b = [ls.f; ls.g]
+
+    # add 1.0 to diagonal for any zero rows in system
+    p = ones(2*ls.dim)
+    p[unique(rowvals(A))] = 0.0
+    A += spdiagm(p)
+
+    # solve A*x = b using LU factorization and update solution vectors
+    x = lufact(A) \ full(b)
+    ls.u = x[1:ls.dim]
+    ls.la = x[ls.dim+1:end]
+
+    return nothing
+end
+
+function run!(analysis::Analysis{Static})
+
+    dofmap = SimpleDOFMap()
+    initialize_dofs!(dofmap, get_problems(analysis))
+
+    # set global dofs for each problem according to the dofmap
+    perm = dofmap.permutation
     info("Node permutation: $perm.")
-    for problem in problems
+    for problem in get_problems(analysis)
         dof_names = get_dof_abbv(problem)
         for element in get_elements(problem)
             connectivity = get_connectivity(element)
@@ -74,48 +119,68 @@ function initialize_dofs!(dofmap, problems)
             set_gdofs!(problem, element, collect(gdofs))
         end
     end
-    info("Analysis dofmap initialized.")
-end
 
-function initialize_dofs(analysis)
-    dofmap = SimpleDOFMap()
-    initialize_dofs!(dofmap, get_problems(analysis))
-    return dofmap
-end
-
-function run!(analysis::Analysis{Static})
-
-    initialize_dofs(analysis)
+    N = length(dofmap.permutation)*length(dofmap.local_dof_indices)
+    info("Maximum number of dofs in assembly: $N.")
 
     p = analysis.properties
     dt = p.initial_increment_time
     time = p.t0
-    n_increment = 0
-    max_iterations = 2
-    done = false
-    while !done
+    ls = LinearSystem(N)
+
+    for n=1:p.max_increments
         # determine dt
         dt = clamp(dt, p.min_increment_time, p.max_increment_time)
         dt = min(dt, p.t1-time)
-        n_increment += 1
         time = min(time+dt, p.t1)
-        converged = false
-        info("Starting increment $n_increment at time $time.")
-        local i
+
+        info("Starting increment $n at time $time.")
         for i=1:p.max_iterations
-            info("Increment # $n_increment. Iteration # $i. Time increment $dt.")
+            info("Increment # $n. Iteration # $i. Time increment $dt.")
+
+            # Assemble matrices for all problems
+            for problem in get_problems(analysis)
+                assemble!(problem, time)
+            end
+
+            # Collect everything to LinearSystem
+            for problem in get_problems(analysis)
+                ls.K += sparse(problem.assembly.K, N, N)
+                ls.Kg += sparse(problem.assembly.Kg, N, N)
+                ls.f += sparse(problem.assembly.f, N, 1)
+                ls.C1 += sparse(problem.assembly.C1, N, N)
+                ls.C2 += sparse(problem.assembly.C2, N, N)
+                ls.D += sparse(problem.assembly.D, N, N)
+                ls.g += sparse(problem.assembly.g, N, 1)
+            end
+
+            # solve linear system
+            solvers = [LUSolver()]
+            solve!(ls, solvers)
+
+            # update solution back to elements
+            for problem in get_problems(analysis)
+                field_name = get_unknown_field_name(problem)
+                field_dim = get_unknown_field_dimension(problem)
+
+            end
+
             converged = true
             if converged
-                info("Increment # $n_increment converged in $i iterations.")
+                info("Increment # $n converged in $i iterations.")
                 break
             end
-        end
-        if i == p.max_iterations && !converged
-            error("Did not converge in $(p.max_iterations) iterations.")
+            if i == p.max_iterations
+                error("Solution of nonlinear system did not converge in $i ",
+                      "iterations.")
+            end
         end
         if isapprox(time, p.t1)
-            info("Step completed!")
-            done = true
+            info("Step completed in $n increments.")
+            break
+        end
+        if n == p.max_increments
+            error("Step did not finish in $n increments.")
         end
     end
 
