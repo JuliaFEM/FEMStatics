@@ -26,6 +26,10 @@ function FEMBase.get_gdofs(dofmap::DOFMap, nodes, dof_names)
     return (max_dim*(perm[j]-1)+ldi[n] for j in nodes for n in dof_names)
 end
 
+function get_gdof(dofmap::DOFMap, node, dof)
+    return first(get_gdofs(dofmap, (node,), (dof, )))
+end
+
 function extract_nodal_field_scalar(dofmap, field_name, u)
     sol = Dict{Int64, Float64}()
     ldi = dofmap.local_dof_indices
@@ -193,6 +197,42 @@ function initialize_dofs!(dofmap, problems; verbose=false)
     return dofmap
 end
 
+"""
+    parse_constraint(dofmap, multipliers, coefficient)
+
+Given dofmap, multipliers and coefficient, determine matrix rows and indices
+where constrains is assembled. Constraint is expression of type
+
+```julia
+dofmap = DOFMap()
+dofmap.local_dof_indices = Dict(:u1 => 1, :u2 => 2)
+dofmap.permutation = Dict(1 => 2, 2 => 1)
+dofmap.fields = Dict("displacement" => [:u1, :u2])
+multipliers = ((1, :u1, 1.0), (2, :u2, -1.5))
+coefficient = 2.0
+constraint = parse_constraint(dofmap, multipliers, coefficient)
+
+# output
+
+(3, [3, 2], [1.0, -1.5], 2.0)
+```
+
+"""
+function parse_constraint(dofmap, multipliers, coefficient)
+    gdofs = [get_gdof(dofmap, j, n) for (j, n, c) in multipliers]
+    mults = collect(map(last, multipliers))
+    return (first(gdofs), gdofs, mults, coefficient)
+end
+
+dofmap = DOFMap()
+dofmap.local_dof_indices = Dict(:u1 => 1, :u2 => 2)
+dofmap.permutation = Dict(1 => 2, 2 => 1)
+dofmap.fields = Dict("displacement" => [:u1, :u2])
+
+#c1 = parse_constraint(dofmap, :(N[1,:u1] - 1.5*N[2,:u2] == 2.0))
+c1 = parse_constraint(dofmap, ((1, :u1, 1.0), (2, :u2, -1.5)), 2.0)
+@test c1 == (3, [3, 2], [1.0, -1.5], 2.0)
+
 struct LUSolver <: AbstractLinearSystemSolver end
 
 """
@@ -270,13 +310,17 @@ function run!(analysis::Analysis{Static})
             p.la = ls.la
 
             # update solution (u,la) back to elements
-            field_names = keys(p.dofmap.fields)
-            fields = Dict(fn => extract_nodal_field(p.dofmap, fn, p.u) for fn in field_names)
-            fields_la = Dict(fn => extract_nodal_field(p.dofmap, fn, p.la) for fn in field_names)
+            # first update fields to the analysis
+            for field_name in keys(p.dofmap.fields)
+                u_field = field(extract_nodal_field(p.dofmap, field_name, p.u))
+                la_field = field(extract_nodal_field(p.dofmap, field_name, p.la))
+                update!(analysis, field_name, time => u_field)
+                update!(analysis, "$field_name (lambda)", time => la_field)
+            end
+            # then for each element assigned to analysis problems
             for problem in get_problems(analysis)
-                for (fn, fv) in fields
-                    update!(problem, fn, time => fv)
-                    update!(problem, "$fn (lambda)", time => fv)
+                for (field_name, field_value) in analysis.fields
+                    update!(problem, field_name, time => field_value)
                 end
             end
 
@@ -306,7 +350,36 @@ struct Elasticity <: FieldProblem end
 struct Beam <: FieldProblem end
 struct Heat <: FieldProblem end
 struct Dirichlet <: BoundaryProblem end
-struct MPC <: BoundaryProblem end
+
+"""
+    Constraint - General type nodal constraint
+
+Constraints are in a vector of tuples, where each tuple is
+    ((node_id, dof_name, multiplier), coefficient)
+
+Constraints are assembled in preprocess before actual assemble using DOFMap to
+get actual matrix rows and columns. Thus type has two presentations, one for
+user input and another one ready for assembly procedure.
+
+Internal presentation: constraints are in a vector of tuples, where each tuple is
+    (row, gdofs, multipliers, coefficient)
+
+For example, equation `1.5*N1[:u1] + 1.0*N2[:u2] == 0.5` is given
+
+```julia
+input_data = ((1, :u1, 1.5), (2, :u2, 1.0), 0.5)
+bc = Constraint()
+push!(bc.constraints, input_data)
+```
+"""
+struct Constraint <: BoundaryProblem
+    constraints :: Vector{Tuple}
+    constraints_internal :: Vector{Tuple}
+end
+
+function Constraint()
+    return Constraint([], [])
+end
 
 field_name(::Problem{Elasticity}) = "displacement"
 field_dofs(::Problem{Elasticity}) = (:u1 => 1, :u2 => 2)
