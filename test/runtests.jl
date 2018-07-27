@@ -65,19 +65,6 @@ function extract_nodal_field(dofmap, field_name, u)
     end
 end
 
-dofmap = DOFMap()
-dofmap.local_dof_indices = Dict(:u1 => 1, :u2 => 2, :u6 => 3, :T => 4)
-dofmap.permutation = Dict(1 => 2, 2 => 1)
-dofmap.fields = Dict("displacement" => [:u1, :u2, :u6], "temperature" => [:T])
-u = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-temperature = extract_nodal_field(dofmap, "temperature", u)
-using Base.Test
-@test temperature[1] == 8.0
-@test temperature[2] == 4.0
-displacement = extract_nodal_field(dofmap, "displacement", u)
-@test displacement[1] == [5.0, 6.0, 7.0]
-@test displacement[2] == [1.0, 2.0, 3.0]
-
 """
     Static
 
@@ -184,6 +171,18 @@ function initialize_dofs!(dofmap, problems; verbose=false)
         end
     end
 
+    info("Setting global dofs for elements")
+    perm = dofmap.permutation
+    for problem in problems
+        is_field_problem(problem) || continue
+        dof_names = map(first, field_dofs(problem))
+        for element in get_elements(problem)
+            connectivity = get_connectivity(element)
+            gdofs = get_gdofs(dofmap, connectivity, dof_names)
+            set_gdofs!(problem, element, collect(gdofs))
+        end
+    end
+
     info("DOFMap summary:")
     dofs_per_node = length(ldi)
     max_dofs = nnodes*dofs_per_node
@@ -228,18 +227,6 @@ function run!(analysis::Analysis{Static})
 
     dofmap = initialize_dofs!(p.dofmap, get_problems(analysis))
 
-    # set global dofs for each element according to the dofmap
-    perm = dofmap.permutation
-    for problem in get_problems(analysis)
-        is_field_problem(problem) || continue
-        dof_names = map(first, field_dofs(problem))
-        for element in get_elements(problem)
-            connectivity = get_connectivity(element)
-            gdofs = get_gdofs(dofmap, connectivity, dof_names)
-            set_gdofs!(problem, element, collect(gdofs))
-        end
-    end
-
     N = length(dofmap.permutation)*length(dofmap.local_dof_indices)
     info("Maximum number of dofs in assembly: $N.")
 
@@ -283,11 +270,15 @@ function run!(analysis::Analysis{Static})
             p.la = ls.la
 
             # update solution (u,la) back to elements
-            # for problem in get_problems(analysis)
-            #     for element in get_elements(problem)
-            #         update_element!(problem, element, u, la, time)
-            #     end
-            # end
+            field_names = keys(p.dofmap.fields)
+            fields = Dict(fn => extract_nodal_field(p.dofmap, fn, p.u) for fn in field_names)
+            fields_la = Dict(fn => extract_nodal_field(p.dofmap, fn, p.la) for fn in field_names)
+            for problem in get_problems(analysis)
+                for (fn, fv) in fields
+                    update!(problem, fn, time => fv)
+                    update!(problem, "$fn (lambda)", time => fv)
+                end
+            end
 
             converged = p.linear || norm(ls.u) < p.convergence_tolerance
             if converged
@@ -308,24 +299,6 @@ function run!(analysis::Analysis{Static})
         end
     end
 
-    return nothing
-end
-
-"""
-    update_element!(problem, element, u, la, time)
-
-Given problem and element, update solution (u,la) to element fields.
-"""
-function update_element!(problem, element, u, la, time)
-    gdofs = get_gdofs(problem, element)
-    connectivity = get_connectivity(element)
-    nnodes = length(element)
-    ue = reshape(u[gdofs], field_dim(problem), nnodes)
-    lae = reshape(la[gdofs], field_dim(problem), nnodes)
-    ued = Dict(j => ue[:,i] for (i,j) in enumerate(connectivity))
-    lad = Dict(j => lae[:,i] for (i,j) in enumerate(connectivity))
-    update!(element, field_name(problem), time => ued)
-    update!(element, "lambda", time => lad)
     return nothing
 end
 
@@ -362,6 +335,84 @@ element5 = Element(Poi1, [4])
 element6 = Element(Poi1, [1])
 element7 = Element(Poi1, [3])
 
+X = Dict(
+    1 => [2.0, 0.0],
+    2 => [2.0, 2.0],
+    3 => [2.0, 0.0],
+    4 => [4.0, 0.0],
+    5 => [0.0, 0.0],
+    6 => [0.0, 2.0])
+
+elements = [element1, element2, element3, element4, element5, element6, element7]
+update!(elements, "geometry", X)
+
+function FEMBase.assemble_elements!(problem::Problem{Elasticity}, assembly::Assembly,
+                            elements::Vector{Element{E}}, time) where E
+    # local stiffness matrix calculated for E=288, nu=1/3 element
+    ke = [
+    144.0   54.0  -90.0    0.0  -72.0  -54.0   18.0    0.0
+     54.0  144.0    0.0   18.0  -54.0  -72.0    0.0  -90.0
+    -90.0    0.0  144.0  -54.0   18.0    0.0  -72.0   54.0
+      0.0   18.0  -54.0  144.0    0.0  -90.0   54.0  -72.0
+    -72.0  -54.0   18.0    0.0  144.0   54.0  -90.0    0.0
+    -54.0  -72.0    0.0  -90.0   54.0  144.0    0.0   18.0
+     18.0    0.0  -72.0   54.0  -90.0    0.0  144.0  -54.0
+      0.0  -90.0   54.0  -72.0    0.0   18.0  -54.0  144.0
+    ]
+    element = first(elements)
+    gdofs = get_gdofs(problem, element)
+    info("elasticity gdofs = $(collect(gdofs))")
+    add!(assembly.K, gdofs, gdofs, ke)
+end
+
+function FEMBase.assemble_elements!(problem::Problem{Heat}, assembly::Assembly,
+                            elements::Vector{Element{E}}, time) where E <: Seg2
+    # local conductance matrix calculated for k = 6.0, A = 2.0, L = 2.0
+    ke = [
+    6.0  -6.0
+   -6.0   6.0
+    ]
+    element = first(elements)
+    gdofs = get_gdofs(problem, element)
+    info("heat seg2 gdofs = $(collect(gdofs))")
+    add!(assembly.K, gdofs, gdofs, ke)
+end
+
+function FEMBase.assemble_elements!(problem::Problem{Heat}, assembly::Assembly,
+                            elements::Vector{Element{E}}, time) where E <: Quad4
+    # local conductance matrix calculated for k = 6.0
+    ke = [
+    4.0  -1.0  -2.0  -1.0
+   -1.0   4.0  -1.0  -2.0
+   -2.0  -1.0   4.0  -1.0
+   -1.0  -2.0  -1.0   4.0
+    ]
+    element = first(elements)
+    gdofs = get_gdofs(problem, element)
+    info("heat quad4 gdofs = $(collect(gdofs))")
+    add!(assembly.K, gdofs, gdofs, ke)
+end
+
+function FEMBase.assemble_elements!(problem::Problem{Beam}, assembly::Assembly,
+                            elements::Vector{Element{E}}, time) where E
+    # local stiffness matrix calculated for L = 2.0, E = 10.0, I = 1.0, A = 2.0
+    ke = [
+    10.0    0.0    0.0  -10.0    0.0    0.0
+     0.0   15.0   15.0    0.0  -15.0   15.0
+     0.0   15.0   20.0    0.0  -15.0   10.0
+   -10.0    0.0    0.0   10.0    0.0    0.0
+     0.0  -15.0  -15.0    0.0   15.0  -15.0
+     0.0   15.0   10.0    0.0  -15.0   20.0
+    ]
+    # local force vector calculated for fy = 3.0, L = 2.0
+    fe = [0.0, 6.0, 4.0, 0.0, 6.0, -4.0]
+    element = first(elements)
+    gdofs = get_gdofs(problem, element)
+    info("beam gdofs = $(collect(gdofs))")
+    add!(assembly.K, gdofs, gdofs, ke)
+    add!(assembly.f, gdofs, fe)
+end
+
 add_elements!(problem1, [element1])
 add_elements!(problem2, [element2])
 add_elements!(problem3, [element1, element2, element3])
@@ -369,6 +420,47 @@ add_elements!(problem4, [element4, element5])
 add_elements!(problem5, [element4, element5])
 add_elements!(problem6, [element6, element7])
 
-analysis = Analysis(Static, "static analysis")
-add_problems!(analysis, [problem1, problem2, problem3, problem4, problem5, problem6])
-run!(analysis)
+time = 0.0
+dofmap = initialize_dofs!(DOFMap(), [problem1, problem2, problem3])
+assemble!(problem1, time)
+assemble!(problem2, time)
+assemble!(problem3, time)
+N = 24
+K1 = full(problem1.assembly.K, N, N)
+K2 = full(problem2.assembly.K, N, N)
+K3 = full(problem3.assembly.K, N, N)
+f1 = full(problem1.assembly.f, N, 1)
+f2 = full(problem2.assembly.f, N, 1)
+f3 = full(problem3.assembly.f, N, 1)
+display(round.(Int, K1))
+display(round.(Int, K2))
+display(round.(Int, K3))
+K = K1+K2+K3
+f = f1+f2+f3
+
+function diagc(K)
+    p = ones(size(K,2))
+    p[unique(rowvals(K))] = 0.0
+    return dropzeros(spdiagm(p))
+end
+diagc(K::Matrix) = diagc(sparse(K))
+
+display(diagc(K))
+
+display(round.(Int, K))
+display(round.(Int, f))
+free_dofs = 1:4*3
+u = zeros(f)
+u[free_dofs] = (K+diagc(K))[free_dofs, free_dofs] \ f[free_dofs]
+display(u)
+info("displacements:")
+for (k,v) in extract_nodal_field(dofmap, "displacement", u)
+    println("$k => $v")
+end
+info("temperature:")
+for (k,v) in extract_nodal_field(dofmap, "temperature", u)
+    println("$k => $v")
+end
+# analysis = Analysis(Static, "static analysis")
+# add_problems!(analysis, [problem1, problem2, problem3, problem4, problem5, problem6])
+# run!(analysis)
