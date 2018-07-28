@@ -286,6 +286,11 @@ function run!(analysis::Analysis{Static})
         for i=1:p.max_iterations
             info("Increment # $n. Iteration # $i. Time increment $dt.")
 
+            # Run a preprocess before starting actual assemble procedure
+            for problem in get_problems(analysis)
+                assemble_preprocess!(problem, time, dofmap)
+            end
+
             # Assemble matrices for all problems
             for problem in get_problems(analysis)
                 assemble!(problem, time)
@@ -349,37 +354,6 @@ end
 struct Elasticity <: FieldProblem end
 struct Beam <: FieldProblem end
 struct Heat <: FieldProblem end
-struct Dirichlet <: BoundaryProblem end
-
-"""
-    Constraint - General type nodal constraint
-
-Constraints are in a vector of tuples, where each tuple is
-    ((node_id, dof_name, multiplier), coefficient)
-
-Constraints are assembled in preprocess before actual assemble using DOFMap to
-get actual matrix rows and columns. Thus type has two presentations, one for
-user input and another one ready for assembly procedure.
-
-Internal presentation: constraints are in a vector of tuples, where each tuple is
-    (row, gdofs, multipliers, coefficient)
-
-For example, equation `1.5*N1[:u1] + 1.0*N2[:u2] == 0.5` is given
-
-```julia
-input_data = ((1, :u1, 1.5), (2, :u2, 1.0), 0.5)
-bc = Constraint()
-push!(bc.constraints, input_data)
-```
-"""
-struct Constraint <: BoundaryProblem
-    constraints :: Vector{Tuple}
-    constraints_internal :: Vector{Tuple}
-end
-
-function Constraint()
-    return Constraint([], [])
-end
 
 field_name(::Problem{Elasticity}) = "displacement"
 field_dofs(::Problem{Elasticity}) = (:u1 => 1, :u2 => 2)
@@ -395,18 +369,10 @@ field_dim(problem) = length(field_dofs(problem))
 problem1 = Problem(Elasticity, "elasticity problem", 2)
 problem2 = Problem(Beam, "beam problem", 3)
 problem3 = Problem(Heat, "heat problem", 1)
-problem4 = Problem(Dirichlet, "fixed displacement", 2, "displacement")
-problem5 = Problem(Dirichlet, "fixed temperature", 1, "temperature")
-problem6 = Problem(MPC, "multi-body constraint problem", 3, "displacement")
+problem4 = Problem(Constraint, "nodal constraints", 3, "displacement")
 
 element1 = Element(Quad4, [5, 1, 2, 6])
 element2 = Element(Seg2, [3, 4])
-element3 = Element(Poi1, [2])
-
-element4 = Element(Seg2, [6, 5])
-element5 = Element(Poi1, [4])
-element6 = Element(Poi1, [1])
-element7 = Element(Poi1, [3])
 
 X = Dict(
     1 => [2.0, 0.0],
@@ -416,11 +382,10 @@ X = Dict(
     5 => [0.0, 0.0],
     6 => [0.0, 2.0])
 
-elements = [element1, element2, element3, element4, element5, element6, element7]
+elements = [element1, element2]
 update!(elements, "geometry", X)
 
-function FEMBase.assemble_elements!(problem::Problem{Elasticity}, assembly::Assembly,
-                            elements::Vector{Element{E}}, time) where E
+function FEMBase.assemble!(problem::Problem{Elasticity}, time)
     # local stiffness matrix calculated for E=288, nu=1/3 element
     ke = [
     144.0   54.0  -90.0    0.0  -72.0  -54.0   18.0    0.0
@@ -432,10 +397,11 @@ function FEMBase.assemble_elements!(problem::Problem{Elasticity}, assembly::Asse
      18.0    0.0  -72.0   54.0  -90.0    0.0  144.0  -54.0
       0.0  -90.0   54.0  -72.0    0.0   18.0  -54.0  144.0
     ]
-    element = first(elements)
+    element = first(get_elements(problem))
     gdofs = get_gdofs(problem, element)
     info("elasticity gdofs = $(collect(gdofs))")
     add!(assembly.K, gdofs, gdofs, ke)
+    return nothing
 end
 
 function FEMBase.assemble_elements!(problem::Problem{Heat}, assembly::Assembly,
@@ -449,6 +415,7 @@ function FEMBase.assemble_elements!(problem::Problem{Heat}, assembly::Assembly,
     gdofs = get_gdofs(problem, element)
     info("heat seg2 gdofs = $(collect(gdofs))")
     add!(assembly.K, gdofs, gdofs, ke)
+    return nothing
 end
 
 function FEMBase.assemble_elements!(problem::Problem{Heat}, assembly::Assembly,
@@ -464,10 +431,10 @@ function FEMBase.assemble_elements!(problem::Problem{Heat}, assembly::Assembly,
     gdofs = get_gdofs(problem, element)
     info("heat quad4 gdofs = $(collect(gdofs))")
     add!(assembly.K, gdofs, gdofs, ke)
+    return nothing
 end
 
-function FEMBase.assemble_elements!(problem::Problem{Beam}, assembly::Assembly,
-                            elements::Vector{Element{E}}, time) where E
+function FEMBase.assemble!(problem::Problem{Beam}, time)
     # local stiffness matrix calculated for L = 2.0, E = 10.0, I = 1.0, A = 2.0
     ke = [
     10.0    0.0    0.0  -10.0    0.0    0.0
@@ -479,25 +446,37 @@ function FEMBase.assemble_elements!(problem::Problem{Beam}, assembly::Assembly,
     ]
     # local force vector calculated for fy = 3.0, L = 2.0
     fe = [0.0, 6.0, 4.0, 0.0, 6.0, -4.0]
-    element = first(elements)
+    element = first(get_elements(problem))
     gdofs = get_gdofs(problem, element)
     info("beam gdofs = $(collect(gdofs))")
     add!(assembly.K, gdofs, gdofs, ke)
     add!(assembly.f, gdofs, fe)
+    return nothing
 end
+
+function FEMBase.assemble!(problem::Problem{Constraint}, time)
+    return nothing
+end
+
+function assemble_preprocess!(problem, time, dofmap)
+    return nothing
+end
+
+function assmeble_preprocess!(problem::Problem{Constraint}, time, dofmap)
+    info("Setting up nodal constraints.")
+end
+
 
 add_elements!(problem1, [element1])
 add_elements!(problem2, [element2])
 add_elements!(problem3, [element1, element2, element3])
-add_elements!(problem4, [element4, element5])
-add_elements!(problem5, [element4, element5])
-add_elements!(problem6, [element6, element7])
 
 time = 0.0
 dofmap = initialize_dofs!(DOFMap(), [problem1, problem2, problem3])
 assemble!(problem1, time)
 assemble!(problem2, time)
 assemble!(problem3, time)
+assemble_preprocess!(problem4, time, dofmap)
 N = 24
 K1 = full(problem1.assembly.K, N, N)
 K2 = full(problem2.assembly.K, N, N)
